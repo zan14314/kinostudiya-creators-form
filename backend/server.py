@@ -19,12 +19,42 @@ def db():
     con.execute('CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated INTEGER NOT NULL)')
     return con
 
+def profile_changes(old, patch):
+    """Only record actual differences submitted by the creator, preserving unseen changes."""
+    changed = {k for k, value in patch.items() if old.get(k) != value}
+    if not changed:
+        return None
+    previous = old.get('changeNotice') or {}
+    sections = set(previous.get('sections', []))
+    roles = set(previous.get('roles', []))
+    project_indexes = set(previous.get('projectIndexes', []))
+    if changed & {'name','city','timezone','timezoneOther','contacts','links','bio'}:
+        sections.add('about')
+    if changed & {'portfolioLinks','portfolioFiles'}:
+        sections.add('portfolio')
+    if changed & {'roles','otherRoles'}:
+        sections.add('directions')
+        roles.update(set(old.get('roles') or []) ^ set(patch.get('roles', old.get('roles')) or []))
+    if 'details' in changed:
+        before, after = old.get('details') or {}, patch.get('details') or {}
+        if isinstance(before,dict) and isinstance(after,dict):
+            roles.update(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            sections.add('experience')
+    if 'projects' in changed:
+        sections.add('projects')
+        before, after = old.get('projects') or [], patch.get('projects') or []
+        if isinstance(before,list) and isinstance(after,list):
+            project_indexes.update(i for i in range(len(after)) if i>=len(before) or before[i]!=after[i])
+    if not sections:
+        return None
+    return {'version':str(time.time_ns()), 'sections':sorted(sections), 'roles':sorted(roles), 'projectIndexes':sorted(project_indexes)}
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'CreatorsAPI/1'
     def cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, PATCH, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Creator-Update')
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
     def reply(self, code, obj):
@@ -57,6 +87,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parts=self.pathparts()
         try:
+            if len(parts)==4 and parts[:2]==['api','profiles'] and parts[3]=='ack' and ID.fullmatch(parts[2]):
+                body=json.loads(self.read(MAX_JSON))
+                if not isinstance(body,dict) or not isinstance(body.get('version'),str): return self.reply(400,{'error':'invalid version'})
+                with db() as con:
+                    con.execute('BEGIN IMMEDIATE')
+                    row=con.execute('SELECT payload FROM profiles WHERE id=?',(parts[2],)).fetchone()
+                    if not row: return self.reply(404,{'error':'not found'})
+                    obj=json.loads(row[0]);notice=obj.get('changeNotice')
+                    if not notice or notice.get('version') != body['version']: return self.reply(409,{'error':'changed again'})
+                    obj.pop('changeNotice',None)
+                    con.execute('UPDATE profiles SET payload=?,updated=? WHERE id=?',(json.dumps(obj,ensure_ascii=False),time.time_ns(),parts[2]))
+                return self.reply(200,{'ok':True})
             if parts==['api','files']:
                 raw=self.read(MAX_FILE); from uuid import uuid4
                 file_id=uuid4().hex
@@ -93,7 +135,11 @@ class Handler(BaseHTTPRequestHandler):
         with db() as con:
             con.execute('BEGIN IMMEDIATE');row=con.execute('SELECT payload FROM profiles WHERE id=?',(parts[2],)).fetchone()
             if not row:return self.reply(404,{'error':'not found'})
-            obj=json.loads(row[0]);obj.update(patch);con.execute('UPDATE profiles SET payload=?,updated=? WHERE id=?',(json.dumps(obj,ensure_ascii=False),time.time_ns(),parts[2]))
+            obj=json.loads(row[0])
+            notice=profile_changes(obj,patch) if self.headers.get('X-Creator-Update')=='1' else None
+            obj.update(patch)
+            if notice: obj['changeNotice']=notice
+            con.execute('UPDATE profiles SET payload=?,updated=? WHERE id=?',(json.dumps(obj,ensure_ascii=False),time.time_ns(),parts[2]))
         return self.reply(200,{'ok':True})
 
 if __name__=='__main__':
