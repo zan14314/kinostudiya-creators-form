@@ -1,0 +1,20 @@
+[Unit]
+Description=Kinostudiya creator applications service
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=kinostudiya-creators
+Environment=CREATORS_DATA_DIR=/var/lib/kinostudiya-creators
+Environment=CREATORS_PORT=4187
+ExecStart=/usr/bin/python3 /opt/kinostudiya-creators/server.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
